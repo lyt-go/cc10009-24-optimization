@@ -59,8 +59,7 @@ npm run dev
 | 渲染任务 | `rendertask` | 渲染作业 | 作业编号、目标URL、浏览器版本 |
 | 采集质量 | `qualityreport` | 质量报告 | 报告编号、作业编号、总URL数 |
 | 带宽控制 | `bandwidth` | 带宽策略 | 策略编号、节点标识、下载带宽上限 |
-| 重试队列 | `retryqueue` | 重试条目 | 条目编号、失败URL、失败原因码 |
-| 翻页管理 | `pagemarker` | 翻页规则 | 规则编号、目标站点、翻页类型 |
+| 重试队列 | `retryqueue` | 重试条目 | 条目编号、失败URL、失败原因码 || 翻页管理 | `pagemarker` | 翻页规则 | 规则编号、目标站点、翻页类型 |
 | 增量标记 | `incrementmark` | 增量水位 | 水位编号、目标源、增量字段名 |
 | 配置同步 | `configsync` | 同步任务 | 任务编号、源节点、目标节点 |
 | 采集API | `scrapeapi` | API定义 | API编号、API名称、请求路径 |
@@ -76,3 +75,42 @@ npm run dev
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA
+
+## 带宽增量限速切换
+
+带宽策略切换不再全量重算节点，而是按「受影响节点」做增量切换，调用链为
+`router（取参/角色）→ services/bandwidth.py（权限与入参校验）→
+services/bandwidth_engine.py（增量切换领域计算）→ store.py（带锁运行态表）`，
+调度落点侧通过 `dispatch` 模块读取分配并回写下载流量。
+
+### 关键约束的落点
+
+| 约束 | 实现位置 |
+| --- | --- |
+| 只重算受影响节点，未受影响节点保持原限速与原版本 | `BandwidthSwitchEngine.switch_policy` 的 `处理范围` |
+| 切换边界、剩余配额可核对 | 切换批次的 `切换边界`、`配额校验` 字段 |
+| 突发耗尽后回落基础带宽，不同时突破基础带宽与突发上限 | `_effective_rate`，离线/过期同样截断 |
+| 节点离线或策略过期不留负数余量 | 剩余额度 `max(0, 额度-已用)`，已用量截断到额度 |
+| 重复下发/重复回写只算一次，不产生双重限速 | 幂等键表 `bandwidth_idempotency` |
+| 同一份分配反复处理只有一个生效版本 | 旧版本置为「已被新版本替换」 |
+| 带宽控制并发结果不分叉 | `store.locked()` 可重入锁串行化读-改-写 |
+| 策略到期与任务完成同时刻的双版本 | 同节点落「冲突截止版 + 生效版」，绑定各自流量快照 |
+| 实际流量与配额版本共同解释下一轮分配 | 流量回写刷新 `流量快照版本`，与 `配额版本` 成对留痕 |
+| 节点归属与限速参数仅管理员可改 | 写接口校验 `X-User-Role`，非 admin 返回 403 |
+| 分配同步到调度落点侧清单并更新业务面 | `dispatch_bandwidth_list`，每节点唯一生效版本 |
+
+### 运行态接口
+
+- `GET  /api/bandwidth/runtime/nodes` 节点带宽运行态（额度、已用量、版本）
+- `GET  /api/bandwidth/runtime/allocations` 节点带宽分配快照（可按节点/批次过滤）
+- `GET  /api/bandwidth/runtime/batches` 与 `/batches/{批次号}` 切换审计
+- `GET  /api/bandwidth/runtime/landing` 调度落点侧清单
+- `POST /api/bandwidth/runtime/switch` 增量切换（body 带 `idempotency_key`）
+- `POST /api/bandwidth/runtime/traffic-writeback` 流量回写（管理员口径）
+- `GET  /api/dispatch/bandwidth/landing` 调度落点侧读取当前生效分配
+- `POST /api/dispatch/bandwidth/traffic-report` 调度落点侧回写实际下载流量
+
+写接口通过请求头 `X-User-Role` 区分角色：`admin` 可写，`viewer`/`operator`/
+`auditor` 只读并返回 403。后端测试位于独立目录 `backend-tests/`，用
+`python -I` 运行，与应用代码隔离。
+
